@@ -1,36 +1,38 @@
 #!/usr/bin/env python3
-"""Build facet-specific player similarity and event-level evidence on top of EventEncoder.
-
-This script extends the original PlayerBERT workflow by:
-1) exporting event embeddings E_i with metadata
-2) aggregating facet-specific player embeddings (e.g., pass / block)
-3) querying facet similarity
-4) retrieving top-k nearest event pairs as evidence
-
-It reuses the EventEncoder architecture defined in train_event_encoder.ipynb.
-"""
+"""Build and query Player x EventType similarity profiles from EventEncoder."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
-from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn as nn
+
+from playerbert_event_features import (
+    build_feat_ids,
+    get_actor_loc,
+    get_event_type,
+    get_freeze_frame,
+    get_player_id,
+    get_player_name,
+)
+from playerbert_models import load_event_encoder_checkpoint
 
 
-UNK_TOKEN = "[UNK]"
+DEFAULT_DATA_PATH = Path("open-data/data/processed/events360_v4.jsonl")
+DEFAULT_EVENT_ENCODER_CKPT = Path("models/event_encoder_mam.pt")
+DEFAULT_PROFILE_CACHE = Path("models/player_eventtype_profiles.pt")
+DEFAULT_PLAYER_EMBEDDINGS = Path("models/player_embeddings.pt")
+DEFAULT_PLAYER_EMBEDDING_NAMES = Path("models/player_embeddings_names.json")
 
 
-def iter_json_objects(fp: Path):
-    """Read JSONL-like files robustly (also handles concatenated JSON objects on one line)."""
+def iter_json_objects(path: Path):
+    """Read JSONL-like files robustly, including concatenated objects per line."""
     decoder = json.JSONDecoder()
-    with fp.open("r", encoding="utf-8") as f:
-        for line in f:
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
             line = line.strip()
             if not line:
                 continue
@@ -43,509 +45,550 @@ def iter_json_objects(fp: Path):
                     idx += 1
 
 
-def get_actor_loc(event: dict[str, Any]) -> tuple[float, float]:
-    loc = event.get("location")
-    if isinstance(loc, list) and len(loc) >= 2:
-        try:
-            return float(loc[0]), float(loc[1])
-        except Exception:
-            return 0.0, 0.0
-    return 0.0, 0.0
+def resolve_device(requested: str | None) -> torch.device:
+    if requested:
+        requested = requested.strip().lower()
+        if requested.startswith("cuda") and not torch.cuda.is_available():
+            print("Requested CUDA, but CUDA is unavailable in this environment. Falling back to CPU.")
+            return torch.device("cpu")
+        return torch.device(requested)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def normalize_value(v: Any) -> str:
-    if isinstance(v, bool):
-        return str(v)
-    if v is None:
-        return UNK_TOKEN
-    return str(v) if not isinstance(v, (str, int, float)) else v  # keep primitive values
+def mixed_sort_key(value: str) -> tuple[int, int | str]:
+    try:
+        return 0, int(value)
+    except Exception:
+        return 1, value
 
 
-class PlayerMLP(nn.Module):
-    def __init__(self, in_dim: int = 6, hidden: int = 64, out_dim: int = 128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, out_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+def normalize_text(value: Any) -> str:
+    return " ".join(str(value).strip().lower().split())
 
 
-class SetEncoder(nn.Module):
-    def __init__(self, player_dim: int = 6, hidden: int = 64, out_dim: int = 128):
-        super().__init__()
-        self.player_mlp = PlayerMLP(in_dim=player_dim, hidden=hidden, out_dim=out_dim)
-
-    def forward(
-        self,
-        freeze_frames: list[Any],
-        actor_locs: list[tuple[float, float]],
-        device: torch.device,
-    ) -> torch.Tensor:
-        batch_embeds = []
-        for ff, (ax, ay) in zip(freeze_frames, actor_locs):
-            if not isinstance(ff, list) or len(ff) == 0:
-                batch_embeds.append(torch.zeros(128, device=device))
-                continue
-            per_player = []
-            for p in ff:
-                if not isinstance(p, dict):
-                    continue
-                loc = p.get("location")
-                if not isinstance(loc, list) or len(loc) < 2:
-                    continue
-                try:
-                    dx = float(loc[0]) - ax
-                    dy = float(loc[1]) - ay
-                except Exception:
-                    continue
-                dist = math.sqrt(dx * dx + dy * dy)
-                angle = math.atan2(dy, dx)
-                is_teammate = 1.0 if p.get("teammate", False) else 0.0
-                is_keeper = 1.0 if p.get("keeper", False) else 0.0
-                vec = torch.tensor(
-                    [dx, dy, dist, angle, is_teammate, is_keeper],
-                    device=device,
-                    dtype=torch.float32,
-                )
-                per_player.append(vec)
-            if not per_player:
-                batch_embeds.append(torch.zeros(128, device=device))
-                continue
-            players = torch.stack(per_player, dim=0)
-            emb = self.player_mlp(players).mean(dim=0)
-            batch_embeds.append(emb)
-        return torch.stack(batch_embeds, dim=0)
+def l2_normalize_rows(matrix: torch.Tensor) -> torch.Tensor:
+    return matrix / matrix.norm(dim=-1, keepdim=True).clamp_min(1e-8)
 
 
-class EventTransformer(nn.Module):
-    def __init__(self, vocab_sizes: dict[str, int], d_model: int = 128, nhead: int = 4, num_layers: int = 2):
-        super().__init__()
-        self.features = list(vocab_sizes.keys())
-        self.safe_names = [f"f{i}" for i in range(len(self.features))]
-        self.name_map = dict(zip(self.features, self.safe_names))
-        self.value_embeds = nn.ModuleDict(
-            {self.name_map[f]: nn.Embedding(vocab_sizes[f], d_model) for f in self.features}
-        )
-        self.feature_embeds = nn.Embedding(len(self.features), d_model)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-    def forward(self, feat_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        tokens = []
-        for i, f in enumerate(self.features):
-            v = self.value_embeds[self.name_map[f]](feat_ids[:, i])
-            f_emb = self.feature_embeds.weight[i]
-            tokens.append(v + f_emb.unsqueeze(0))
-        x = torch.stack(tokens, dim=1)
-        h = self.encoder(x)
-        z_event = h.mean(dim=1)
-        return z_event, h
+def l2_normalize_vector(vector: torch.Tensor) -> torch.Tensor:
+    return vector / vector.norm().clamp_min(1e-8)
 
 
-class EventEncoder(nn.Module):
-    def __init__(self, vocab_sizes: dict[str, int]):
-        super().__init__()
-        self.event_encoder = EventTransformer(vocab_sizes)
-        self.frame_encoder = SetEncoder()
-        self.gate = nn.Sequential(nn.Linear(128 * 2, 128), nn.Sigmoid())
-
-    def forward(
-        self,
-        feat_ids: torch.Tensor,
-        freeze_frames: list[Any],
-        actor_locs: list[tuple[float, float]],
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        z_event, h_tokens = self.event_encoder(feat_ids)
-        z_frame = self.frame_encoder(freeze_frames, actor_locs, device)
-        g = self.gate(torch.cat([z_event, z_frame], dim=-1))
-        z = g * z_event + (1 - g) * z_frame
-        return z, h_tokens
+def cosine_scores(matrix: torch.Tensor, query_vector: torch.Tensor) -> torch.Tensor:
+    return l2_normalize_rows(matrix) @ l2_normalize_vector(query_vector)
 
 
-def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    a_n = a / (a.norm(dim=-1, keepdim=True).clamp_min(1e-8))
-    b_n = b / (b.norm(dim=-1, keepdim=True).clamp_min(1e-8))
-    return a_n @ b_n.T
-
-
-def summarize_event(ev: dict[str, Any]) -> str:
-    keys = [
-        "type.name",
-        "location_bucket.label",
-        "pass.length_bucket",
-        "pass.angle_bucket",
-        "pass.end_location_bucket.label",
-        "pass.outcome.name",
-        "under_pressure",
-        "position.name",
-        "period",
-        "minute",
-        "second",
-        "match_id",
-    ]
-    parts = []
-    for k in keys:
-        if k in ev and ev.get(k) is not None:
-            parts.append(f"{k}={ev.get(k)}")
-    return ", ".join(parts[:8]) if parts else "(no summary fields)"
-
-
-def build_event_rows(
-    data_path: Path,
-    feature_vocab: dict[str, dict[Any, int]],
-    model: EventEncoder,
+def flush_embedding_batch(
+    *,
+    model,
     device: torch.device,
+    batch_feat_ids: list[torch.Tensor],
+    batch_freeze_frames: list[Any],
+    batch_actor_locs: list[tuple[float, float]],
+    batch_keys: list[tuple[str, str]],
+    sum_vecs: dict[tuple[str, str], torch.Tensor],
+    counts: dict[tuple[str, str], int],
+) -> int:
+    if not batch_feat_ids:
+        return 0
+
+    feat_tensor = torch.stack(batch_feat_ids, dim=0).to(device)
+    with torch.no_grad():
+        event_embeddings, _ = model(feat_tensor, batch_freeze_frames, batch_actor_locs, device)
+
+    processed = 0
+    for key, embedding in zip(batch_keys, event_embeddings.detach().cpu(), strict=False):
+        embedding = embedding.float()
+        if key in sum_vecs:
+            sum_vecs[key].add_(embedding)
+        else:
+            sum_vecs[key] = embedding.clone()
+        counts[key] = counts.get(key, 0) + 1
+        processed += 1
+
+    batch_feat_ids.clear()
+    batch_freeze_frames.clear()
+    batch_actor_locs.clear()
+    batch_keys.clear()
+    return processed
+
+
+def save_profile_cache(path: Path, cache: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(cache, path)
+
+
+def load_profile_cache(path: Path) -> dict[str, Any]:
+    return torch.load(path, map_location="cpu")
+
+
+def build_player_eventtype_profiles(
+    *,
+    data_path: Path,
+    checkpoint_path: Path,
+    output_path: Path,
     batch_size: int,
+    min_count_to_store: int,
+    device_name: str | None,
+    unknown_event_type: str | None,
+    log_every: int,
 ) -> dict[str, Any]:
-    feature_list = list(feature_vocab.keys())
-    events_iter = iter_json_objects(data_path)
+    device = resolve_device(device_name)
+    model, feature_vocab, _ = load_event_encoder_checkpoint(checkpoint_path, device)
 
-    embeddings = []
-    metadata = []
+    sum_vecs: dict[tuple[str, str], torch.Tensor] = {}
+    counts: dict[tuple[str, str], int] = {}
+    player_names: dict[str, str] = {}
+    player_ids_seen: set[str] = set()
+    event_types_seen: set[str] = set()
 
-    feat_batch: list[list[int]] = []
-    ff_batch: list[Any] = []
-    actor_batch: list[tuple[float, float]] = []
-    meta_batch: list[dict[str, Any]] = []
+    total_rows = 0
+    encoded_rows = 0
+    skipped_missing_player = 0
+    skipped_missing_type = 0
 
-    def flush_batch():
-        if not feat_batch:
-            return
-        feat_tensor = torch.tensor(feat_batch, dtype=torch.long, device=device)
-        with torch.no_grad():
-            z, _ = model(feat_tensor, ff_batch, actor_batch, device)
-        embeddings.append(z.cpu())
-        metadata.extend(meta_batch)
-        feat_batch.clear()
-        ff_batch.clear()
-        actor_batch.clear()
-        meta_batch.clear()
+    batch_feat_ids: list[torch.Tensor] = []
+    batch_freeze_frames: list[Any] = []
+    batch_actor_locs: list[tuple[float, float]] = []
+    batch_keys: list[tuple[str, str]] = []
 
-    for idx, ev in enumerate(events_iter):
-        feat_ids = []
-        for feat in feature_list:
-            v = normalize_value(ev.get(feat, UNK_TOKEN))
-            feat_ids.append(feature_vocab[feat].get(v, feature_vocab[feat].get(UNK_TOKEN, 0)))
+    for event in iter_json_objects(data_path):
+        total_rows += 1
 
-        feat_batch.append(feat_ids)
-        ff_batch.append(ev.get("freeze_frame"))
-        actor_batch.append(get_actor_loc(ev))
-        meta_batch.append(
-            {
-                "row_idx": idx,
-                "player_id": ev.get("player.id"),
-                "player_name": ev.get("player.name"),
-                "match_id": ev.get("match_id"),
-                "event_type": ev.get("type.name"),
-                "period": ev.get("period"),
-                "minute": ev.get("minute"),
-                "second": ev.get("second"),
-                "event": ev,
-            }
-        )
-        if len(feat_batch) >= batch_size:
-            flush_batch()
-
-    flush_batch()
-
-    if not embeddings:
-        raise RuntimeError("No events were encoded. Check data_path.")
-
-    return {"embeddings": torch.cat(embeddings, dim=0), "metadata": metadata}
-
-
-def build_facet_rows(
-    event_store: dict[str, Any],
-    facet_field: str,
-    min_events: int,
-    robust: bool = False,
-) -> dict[str, Any]:
-    emb = event_store["embeddings"]
-    meta = event_store["metadata"]
-    groups: dict[tuple[Any, Any], list[int]] = defaultdict(list)
-    general_groups: dict[Any, list[int]] = defaultdict(list)
-
-    for i, m in enumerate(meta):
-        pid = m.get("player_id")
-        ev = m.get("event", {})
-        facet_value = ev.get(facet_field)
-        if pid is None:
+        player_id = get_player_id(event)
+        if player_id is None:
+            skipped_missing_player += 1
             continue
-        general_groups[pid].append(i)
-        if facet_value is not None:
-            groups[(pid, facet_value)].append(i)
 
-    rows = []
+        event_type = get_event_type(event)
+        if event_type is None:
+            if unknown_event_type is None:
+                skipped_missing_type += 1
+                continue
+            event_type = unknown_event_type
 
-    def aggregate(x: torch.Tensor) -> torch.Tensor:
-        if not robust or x.shape[0] < 5:
-            return x.mean(dim=0)
-        center = x.mean(dim=0, keepdim=True)
-        d = ((x - center) ** 2).sum(dim=1)
-        keep = max(1, int(math.ceil(0.8 * x.shape[0])))
-        _, idxs = torch.topk(d, k=keep, largest=False)
-        return x[idxs].mean(dim=0)
+        player_name = get_player_name(event)
+        if player_name:
+            player_names.setdefault(player_id, player_name)
 
-    for (pid, facet_value), idxs in groups.items():
-        if len(idxs) < min_events:
+        player_ids_seen.add(player_id)
+        event_types_seen.add(event_type)
+
+        batch_feat_ids.append(build_feat_ids(event, feature_vocab))
+        batch_freeze_frames.append(get_freeze_frame(event))
+        batch_actor_locs.append(get_actor_loc(event))
+        batch_keys.append((player_id, event_type))
+
+        if len(batch_feat_ids) >= batch_size:
+            encoded_rows += flush_embedding_batch(
+                model=model,
+                device=device,
+                batch_feat_ids=batch_feat_ids,
+                batch_freeze_frames=batch_freeze_frames,
+                batch_actor_locs=batch_actor_locs,
+                batch_keys=batch_keys,
+                sum_vecs=sum_vecs,
+                counts=counts,
+            )
+
+        if log_every > 0 and total_rows % log_every == 0:
+            print(
+                f"rows={total_rows} encoded={encoded_rows} "
+                f"active_profiles={len(sum_vecs)} skipped_no_player={skipped_missing_player} "
+                f"skipped_no_type={skipped_missing_type}",
+                flush=True,
+            )
+
+    encoded_rows += flush_embedding_batch(
+        model=model,
+        device=device,
+        batch_feat_ids=batch_feat_ids,
+        batch_freeze_frames=batch_freeze_frames,
+        batch_actor_locs=batch_actor_locs,
+        batch_keys=batch_keys,
+        sum_vecs=sum_vecs,
+        counts=counts,
+    )
+
+    profiles: dict[str, dict[str, torch.Tensor]] = {}
+    profile_counts: dict[str, dict[str, int]] = {}
+    stored_event_types: set[str] = set()
+
+    for (player_id, event_type), sum_vec in sum_vecs.items():
+        count = counts[(player_id, event_type)]
+        if count < min_count_to_store:
             continue
-        x = emb[idxs]
-        rows.append(
-            {
-                "player_id": pid,
-                "facet_field": facet_field,
-                "facet_value": facet_value,
-                "count": len(idxs),
-                "embedding": aggregate(x),
-            }
-        )
+        profiles.setdefault(player_id, {})[event_type] = (sum_vec / count).float()
+        profile_counts.setdefault(player_id, {})[event_type] = count
+        stored_event_types.add(event_type)
 
-    general_rows = []
-    for pid, idxs in general_groups.items():
-        if len(idxs) < min_events:
-            continue
-        general_rows.append({"player_id": pid, "count": len(idxs), "embedding": aggregate(emb[idxs])})
+    stored_player_ids = sorted(profiles.keys(), key=mixed_sort_key)
+    stored_event_types_list = sorted(stored_event_types)
+    stored_player_names = {player_id: player_names.get(player_id, player_id) for player_id in stored_player_ids}
 
-    return {"facet_rows": rows, "general_rows": general_rows}
-
-
-def save_event_store(path: Path, store: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(store, path)
-
-
-def save_facet_store(path: Path, store: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    serializable = {
-        "facet_rows": [
-            {**{k: v for k, v in row.items() if k != "embedding"}, "embedding": row["embedding"].cpu()}
-            for row in store["facet_rows"]
-        ],
-        "general_rows": [
-            {**{k: v for k, v in row.items() if k != "embedding"}, "embedding": row["embedding"].cpu()}
-            for row in store["general_rows"]
-        ],
+    cache = {
+        "version": 1,
+        "data_path": str(data_path),
+        "checkpoint_path": str(checkpoint_path),
+        "device_used": str(device),
+        "batch_size": batch_size,
+        "min_count_to_store": min_count_to_store,
+        "player_ids": stored_player_ids,
+        "event_types": stored_event_types_list,
+        "profiles": profiles,
+        "counts": profile_counts,
+        "player_names": stored_player_names,
+        "stats": {
+            "total_rows": total_rows,
+            "encoded_rows": encoded_rows,
+            "skipped_missing_player": skipped_missing_player,
+            "skipped_missing_type": skipped_missing_type,
+            "players_seen": len(player_ids_seen),
+            "event_types_seen": len(event_types_seen),
+            "stored_players": len(stored_player_ids),
+            "stored_event_types": len(stored_event_types_list),
+            "stored_profiles": sum(len(type_map) for type_map in profiles.values()),
+        },
     }
-    torch.save(serializable, path)
+    save_profile_cache(output_path, cache)
+    return cache
+
+
+def resolve_player_id_from_query(player_query: str, player_names: dict[str, str], valid_player_ids: set[str]) -> str:
+    player_query = str(player_query).strip()
+    if player_query in valid_player_ids:
+        return player_query
+
+    exact = [player_id for player_id, name in player_names.items() if name == player_query]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise ValueError(f"Ambiguous player name '{player_query}'. Matches ids: {', '.join(exact)}")
+
+    folded_query = normalize_text(player_query)
+    folded = [player_id for player_id, name in player_names.items() if normalize_text(name) == folded_query]
+    if len(folded) == 1:
+        return folded[0]
+    if len(folded) > 1:
+        raise ValueError(f"Ambiguous player name '{player_query}'. Matches ids: {', '.join(folded)}")
+
+    raise ValueError(f"Player '{player_query}' not found.")
+
+
+def resolve_event_type_from_query(event_type_query: str, event_types: list[str]) -> str:
+    if event_type_query in event_types:
+        return event_type_query
+
+    folded_query = normalize_text(event_type_query)
+    folded = [event_type for event_type in event_types if normalize_text(event_type) == folded_query]
+    if len(folded) == 1:
+        return folded[0]
+    if len(folded) > 1:
+        raise ValueError(f"Ambiguous event type '{event_type_query}'. Matches: {', '.join(folded)}")
+    raise ValueError(f"Event type '{event_type_query}' not found.")
+
+
+def query_player_event_type(
+    cache: dict[str, Any],
+    *,
+    player_query: str,
+    event_type_query: str,
+    top_k: int,
+    min_count: int,
+) -> dict[str, Any]:
+    profiles = cache["profiles"]
+    counts = cache["counts"]
+    player_names = cache.get("player_names", {})
+
+    player_id = resolve_player_id_from_query(player_query, player_names, set(cache["player_ids"]))
+    event_type = resolve_event_type_from_query(event_type_query, cache["event_types"])
+
+    target_count = counts.get(player_id, {}).get(event_type, 0)
+    target_vec = profiles.get(player_id, {}).get(event_type)
+    if target_vec is None:
+        raise ValueError(f"Player '{player_query}' has no stored profile for event type '{event_type}'.")
+    if target_count < min_count:
+        raise ValueError(
+            f"Target player only has count={target_count} for event type '{event_type}', below min_count={min_count}."
+        )
+
+    candidate_ids: list[str] = []
+    candidate_counts: list[int] = []
+    candidate_vecs: list[torch.Tensor] = []
+    for candidate_id in cache["player_ids"]:
+        count = counts.get(candidate_id, {}).get(event_type, 0)
+        vec = profiles.get(candidate_id, {}).get(event_type)
+        if vec is None or count < min_count:
+            continue
+        candidate_ids.append(candidate_id)
+        candidate_counts.append(count)
+        candidate_vecs.append(vec.float())
+
+    if not candidate_vecs:
+        raise ValueError(f"No candidates satisfy min_count={min_count} for event type '{event_type}'.")
+
+    matrix = torch.stack(candidate_vecs, dim=0)
+    sims = cosine_scores(matrix, target_vec.float())
+    ranked = torch.argsort(sims, descending=True).tolist()
+
+    results = []
+    for idx in ranked:
+        candidate_id = candidate_ids[idx]
+        if candidate_id == player_id:
+            continue
+        results.append(
+            {
+                "player_id": candidate_id,
+                "player_name": player_names.get(candidate_id, candidate_id),
+                "similarity": float(sims[idx]),
+                "count": candidate_counts[idx],
+            }
+        )
+        if len(results) >= top_k:
+            break
+
+    return {
+        "player_id": player_id,
+        "player_name": player_names.get(player_id, player_id),
+        "event_type": event_type,
+        "query_count": target_count,
+        "top_k": top_k,
+        "min_count": min_count,
+        "results": results,
+    }
+
+
+def query_all_event_types(
+    cache: dict[str, Any],
+    *,
+    player_query: str,
+    top_k: int,
+    min_count: int,
+) -> dict[str, Any]:
+    player_names = cache.get("player_names", {})
+    player_id = resolve_player_id_from_query(player_query, player_names, set(cache["player_ids"]))
+    player_type_counts = cache["counts"].get(player_id, {})
+
+    event_types = sorted(
+        [event_type for event_type, count in player_type_counts.items() if count >= min_count],
+        key=lambda event_type: (-player_type_counts[event_type], event_type),
+    )
+    reports = [
+        query_player_event_type(
+            cache,
+            player_query=player_id,
+            event_type_query=event_type,
+            top_k=top_k,
+            min_count=min_count,
+        )
+        for event_type in event_types
+    ]
+
+    return {
+        "player_id": player_id,
+        "player_name": player_names.get(player_id, player_id),
+        "min_count": min_count,
+        "reports": reports,
+    }
+
+
+def load_global_player_embedding_assets(
+    embeddings_path: Path,
+    names_path: Path | None = None,
+) -> tuple[list[str], torch.Tensor, dict[str, str]]:
+    emb_data = torch.load(embeddings_path, map_location="cpu")
+    player_ids = [str(player_id) for player_id in emb_data["player_ids"]]
+    embeddings = emb_data["embeddings"].float()
+
+    player_names: dict[str, str] = {}
+    if names_path is not None and names_path.exists():
+        with names_path.open("r", encoding="utf-8") as handle:
+            raw_names = json.load(handle)
+        player_names = {str(player_id): str(name) for player_id, name in raw_names.items()}
+    elif "player_names" in emb_data:
+        player_names = {str(player_id): str(name) for player_id, name in emb_data["player_names"].items()}
+
+    return player_ids, embeddings, player_names
+
+
+def find_similar_players(
+    player_query: str,
+    top_k: int = 10,
+    embeddings_path: Path = DEFAULT_PLAYER_EMBEDDINGS,
+    names_path: Path = DEFAULT_PLAYER_EMBEDDING_NAMES,
+) -> list[dict[str, Any]]:
+    player_ids, embeddings, player_names = load_global_player_embedding_assets(embeddings_path, names_path)
+    player_id = resolve_player_id_from_query(player_query, player_names, set(player_ids))
+    id_to_idx = {candidate_id: idx for idx, candidate_id in enumerate(player_ids)}
+
+    query_idx = id_to_idx[player_id]
+    query_vec = embeddings[query_idx]
+    sims = cosine_scores(embeddings, query_vec)
+    ranked = torch.argsort(sims, descending=True).tolist()
+
+    results = []
+    for idx in ranked:
+        candidate_id = player_ids[idx]
+        if candidate_id == player_id:
+            continue
+        results.append(
+            {
+                "player_id": candidate_id,
+                "player_name": player_names.get(candidate_id, candidate_id),
+                "similarity": float(sims[idx]),
+            }
+        )
+        if len(results) >= top_k:
+            break
+    return results
+
+
+def find_similar_players_by_event_type(
+    player_query: str,
+    event_type: str,
+    top_k: int = 10,
+    min_count: int = 20,
+    profiles_path: Path = DEFAULT_PROFILE_CACHE,
+) -> dict[str, Any]:
+    cache = load_profile_cache(profiles_path)
+    return query_player_event_type(
+        cache,
+        player_query=player_query,
+        event_type_query=event_type,
+        top_k=top_k,
+        min_count=min_count,
+    )
+
+
+def report_similarities_all_types(
+    player_query: str,
+    top_k: int = 10,
+    min_count: int = 20,
+    profiles_path: Path = DEFAULT_PROFILE_CACHE,
+) -> dict[str, Any]:
+    cache = load_profile_cache(profiles_path)
+    return query_all_event_types(
+        cache,
+        player_query=player_query,
+        top_k=top_k,
+        min_count=min_count,
+    )
+
+
+def print_event_type_query(result: dict[str, Any]) -> None:
+    print(
+        f"Top {result['top_k']} similar players to {result['player_name']} "
+        f"for event_type={result['event_type']} (query_count={result['query_count']}):"
+    )
+    for row in result["results"]:
+        print(
+            f"  {row['player_name']} "
+            f"(player_id={row['player_id']}, sim={row['similarity']:.4f}, count={row['count']})"
+        )
+
+
+def print_all_type_report(report: dict[str, Any]) -> None:
+    print(
+        f"Per-event-type similarity report for {report['player_name']} "
+        f"(player_id={report['player_id']}, min_count={report['min_count']}):"
+    )
+    for item in report["reports"]:
+        print()
+        print_event_type_query(item)
 
 
 def cmd_build(args: argparse.Namespace) -> None:
-    device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
-    state = torch.load(args.checkpoint, map_location=device)
-    feature_vocab = state["feature_vocab"]
-    vocab_sizes = {k: len(v) for k, v in feature_vocab.items()}
-
-    model = EventEncoder(vocab_sizes).to(device)
-    model.load_state_dict(state["event_encoder"], strict=True)
-    model.eval()
-
-    event_store = build_event_rows(
+    cache = build_player_eventtype_profiles(
         data_path=args.data,
-        feature_vocab=feature_vocab,
-        model=model,
-        device=device,
+        checkpoint_path=args.checkpoint,
+        output_path=args.out,
         batch_size=args.batch_size,
+        min_count_to_store=args.min_count_to_store,
+        device_name=args.device,
+        unknown_event_type=args.unknown_event_type,
+        log_every=args.log_every,
     )
-    save_event_store(args.event_out, event_store)
-
-    facet_store = build_facet_rows(
-        event_store=event_store,
-        facet_field=args.facet_field,
-        min_events=args.min_events,
-        robust=args.robust_mean,
-    )
-    save_facet_store(args.facet_out, facet_store)
-
-    print(f"Encoded events: {event_store['embeddings'].shape[0]}")
-    print(f"Event embedding dim: {event_store['embeddings'].shape[1]}")
-    print(f"Facet rows: {len(facet_store['facet_rows'])}")
-    print(f"General rows: {len(facet_store['general_rows'])}")
-    print(f"Saved event store: {args.event_out}")
-    print(f"Saved facet store: {args.facet_out}")
-
-
-def _find_player_name(event_meta: list[dict[str, Any]], player_id: Any) -> str | None:
-    for m in event_meta:
-        if m.get("player_id") == player_id and m.get("player_name"):
-            return m["player_name"]
-    return None
-
-
-def _build_facet_matrix(facet_rows: list[dict[str, Any]], facet_field: str, facet_value: str, min_events: int):
-    rows = [
-        r
-        for r in facet_rows
-        if r.get("facet_field") == facet_field
-        and str(r.get("facet_value")) == facet_value
-        and int(r.get("count", 0)) >= min_events
-    ]
-    if not rows:
-        return rows, None
-    matrix = torch.stack([r["embedding"] for r in rows], dim=0).float()
-    return rows, matrix
-
-
-def _print_top_similar(
-    facet_store: dict[str, Any],
-    event_store: dict[str, Any],
-    player_id: Any,
-    facet_field: str,
-    facet_value: str,
-    top_k: int,
-    min_events: int,
-) -> None:
-    rows, matrix = _build_facet_matrix(facet_store["facet_rows"], facet_field, facet_value, min_events)
-    if matrix is None:
-        print("No facet rows found for this facet.")
-        return
-
-    target_idx = None
-    for i, r in enumerate(rows):
-        if str(r.get("player_id")) == str(player_id):
-            target_idx = i
-            break
-    if target_idx is None:
-        print(f"Player {player_id} not found for facet {facet_field}={facet_value}.")
-        return
-
-    sims = cosine_similarity(matrix[target_idx : target_idx + 1], matrix).squeeze(0)
-    ranked = torch.argsort(sims, descending=True).tolist()
-    target_name = _find_player_name(event_store["metadata"], player_id)
-    print(f"Facet similarity for player {player_id} ({target_name or 'unknown'}) on {facet_field}={facet_value}")
-    shown = 0
-    for idx in ranked:
-        row = rows[idx]
-        pid = row["player_id"]
-        if str(pid) == str(player_id):
-            continue
-        name = _find_player_name(event_store["metadata"], pid)
-        print(
-            f"  player_id={pid} name={name or 'unknown'} "
-            f"sim={float(sims[idx]):.4f} count={row['count']}"
-        )
-        shown += 1
-        if shown >= top_k:
-            break
-
-
-def _event_indices_for_player_facet(
-    event_store: dict[str, Any],
-    player_id: Any,
-    facet_field: str,
-    facet_value: str,
-) -> list[int]:
-    idxs = []
-    for i, m in enumerate(event_store["metadata"]):
-        if str(m.get("player_id")) != str(player_id):
-            continue
-        ev = m.get("event", {})
-        if str(ev.get(facet_field)) == facet_value:
-            idxs.append(i)
-    return idxs
-
-
-def _print_evidence_pairs(
-    event_store: dict[str, Any],
-    player_a: Any,
-    player_b: Any,
-    facet_field: str,
-    facet_value: str,
-    top_k: int,
-) -> None:
-    idx_a = _event_indices_for_player_facet(event_store, player_a, facet_field, facet_value)
-    idx_b = _event_indices_for_player_facet(event_store, player_b, facet_field, facet_value)
-    if not idx_a or not idx_b:
-        print("No events found for evidence retrieval on this facet.")
-        return
-
-    emb = event_store["embeddings"].float()
-    a_mat = emb[idx_a]
-    b_mat = emb[idx_b]
-    sims = cosine_similarity(a_mat, b_mat)
-
-    flat_scores = sims.flatten()
-    k = min(top_k, flat_scores.numel())
-    vals, flat_idx = torch.topk(flat_scores, k=k, largest=True)
-
-    print(f"Top-{k} evidence event pairs for {facet_field}={facet_value}")
-    used_pairs = set()
-    out_count = 0
-    for score, fid in zip(vals.tolist(), flat_idx.tolist()):
-        ai = fid // sims.shape[1]
-        bi = fid % sims.shape[1]
-        global_ai = idx_a[ai]
-        global_bi = idx_b[bi]
-        # simple dedupe to avoid exact repeats in output
-        if (global_ai, global_bi) in used_pairs:
-            continue
-        used_pairs.add((global_ai, global_bi))
-        ev_a = event_store["metadata"][global_ai]["event"]
-        ev_b = event_store["metadata"][global_bi]["event"]
-        print(f"  pair {out_count + 1}: sim={score:.4f}")
-        print(f"    A: {summarize_event(ev_a)}")
-        print(f"    B: {summarize_event(ev_b)}")
-        out_count += 1
-        if out_count >= top_k:
-            break
+    print("Build complete.")
+    print(f"Saved profile cache: {args.out}")
+    print(f"Stored players: {cache['stats']['stored_players']}")
+    print(f"Stored event types: {cache['stats']['stored_event_types']}")
+    print(f"Stored player x event_type profiles: {cache['stats']['stored_profiles']}")
+    print(f"Encoded rows: {cache['stats']['encoded_rows']}")
 
 
 def cmd_query(args: argparse.Namespace) -> None:
-    event_store = torch.load(args.event_store, map_location="cpu")
-    facet_store = torch.load(args.facet_store, map_location="cpu")
-
-    _print_top_similar(
-        facet_store=facet_store,
-        event_store=event_store,
-        player_id=args.player_id,
-        facet_field=args.facet_field,
-        facet_value=args.facet_value,
+    cache = load_profile_cache(args.profiles)
+    result = query_player_event_type(
+        cache,
+        player_query=args.player,
+        event_type_query=args.event_type,
         top_k=args.top_k,
-        min_events=args.min_events,
+        min_count=args.min_count,
     )
+    print_event_type_query(result)
 
-    if args.compare_player_id is not None:
-        _print_evidence_pairs(
-            event_store=event_store,
-            player_a=args.player_id,
-            player_b=args.compare_player_id,
-            facet_field=args.facet_field,
-            facet_value=args.facet_value,
-            top_k=args.evidence_k,
-        )
+
+def cmd_query_all_types(args: argparse.Namespace) -> None:
+    cache = load_profile_cache(args.profiles)
+    report = query_all_event_types(
+        cache,
+        player_query=args.player,
+        top_k=args.top_k,
+        min_count=args.min_count,
+    )
+    print_all_type_report(report)
+
+
+def cmd_query_global(args: argparse.Namespace) -> None:
+    results = find_similar_players(
+        player_query=args.player,
+        top_k=args.top_k,
+        embeddings_path=args.embeddings,
+        names_path=args.names,
+    )
+    print(f"Top {args.top_k} global-similarity matches for {args.player}:")
+    for row in results:
+        print(f"  {row['player_name']} (player_id={row['player_id']}, sim={row['similarity']:.4f})")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Facet similarity + evidence tools for PlayerBERT EventEncoder outputs.")
+    parser = argparse.ArgumentParser(
+        description="Build and query Player x EventType similarity profiles from EventEncoder embeddings."
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_build = sub.add_parser("build", help="Encode events and build facet embeddings.")
-    p_build.add_argument("--data", type=Path, required=True, help="Processed events JSONL (e.g., events360_v4.jsonl)")
-    p_build.add_argument("--checkpoint", type=Path, required=True, help="Saved event encoder checkpoint (.pt)")
-    p_build.add_argument("--event-out", type=Path, required=True, help="Output .pt file for event embeddings + metadata")
-    p_build.add_argument("--facet-out", type=Path, required=True, help="Output .pt file for facet embeddings")
-    p_build.add_argument("--facet-field", type=str, default="type.name", help="Facet field to aggregate by")
+    p_build = sub.add_parser("build", help="Stream JSONL and build Player x EventType profile cache.")
+    p_build.add_argument("--data", type=Path, default=DEFAULT_DATA_PATH)
+    p_build.add_argument("--checkpoint", type=Path, default=DEFAULT_EVENT_ENCODER_CKPT)
+    p_build.add_argument("--out", type=Path, default=DEFAULT_PROFILE_CACHE)
     p_build.add_argument("--batch-size", type=int, default=256)
-    p_build.add_argument("--min-events", type=int, default=20)
-    p_build.add_argument("--robust-mean", action="store_true", help="Use trimmed robust mean aggregation")
-    p_build.add_argument("--device", type=str, default=None, help="cpu / cuda")
+    p_build.add_argument("--min-count-to-store", type=int, default=1)
+    p_build.add_argument("--unknown-event-type", type=str, default=None)
+    p_build.add_argument("--device", type=str, default=None, help="Auto, cpu, cuda, cuda:0, etc.")
+    p_build.add_argument("--log-every", type=int, default=50000)
     p_build.set_defaults(func=cmd_build)
 
-    p_query = sub.add_parser("query", help="Query facet similarity and evidence pairs.")
-    p_query.add_argument("--event-store", type=Path, required=True)
-    p_query.add_argument("--facet-store", type=Path, required=True)
-    p_query.add_argument("--player-id", required=True)
-    p_query.add_argument("--facet-field", type=str, default="type.name")
-    p_query.add_argument("--facet-value", type=str, required=True, help='Example: "Pass"')
-    p_query.add_argument("--top-k", type=int, default=5, help="Top similar players to print")
-    p_query.add_argument("--min-events", type=int, default=20)
-    p_query.add_argument("--compare-player-id", default=None, help="If set, also print evidence pairs vs this player")
-    p_query.add_argument("--evidence-k", type=int, default=5)
+    p_query = sub.add_parser("query", help="Query similar players for one event type.")
+    p_query.add_argument("--profiles", type=Path, default=DEFAULT_PROFILE_CACHE)
+    p_query.add_argument("--player", required=True, help="Player name or player id")
+    p_query.add_argument("--event-type", required=True, help='Example: "Pass"')
+    p_query.add_argument("--top-k", type=int, default=10)
+    p_query.add_argument("--min-count", type=int, default=20)
     p_query.set_defaults(func=cmd_query)
+
+    p_query_all = sub.add_parser("query-all-types", help="Run top-k similarity for every event type of a player.")
+    p_query_all.add_argument("--profiles", type=Path, default=DEFAULT_PROFILE_CACHE)
+    p_query_all.add_argument("--player", required=True, help="Player name or player id")
+    p_query_all.add_argument("--top-k", type=int, default=10)
+    p_query_all.add_argument("--min-count", type=int, default=20)
+    p_query_all.set_defaults(func=cmd_query_all_types)
+
+    p_query_global = sub.add_parser("query-global", help="Query the original whole-player embedding cache.")
+    p_query_global.add_argument("--player", required=True, help="Player name or player id")
+    p_query_global.add_argument("--top-k", type=int, default=10)
+    p_query_global.add_argument("--embeddings", type=Path, default=DEFAULT_PLAYER_EMBEDDINGS)
+    p_query_global.add_argument("--names", type=Path, default=DEFAULT_PLAYER_EMBEDDING_NAMES)
+    p_query_global.set_defaults(func=cmd_query_global)
 
     return parser.parse_args()
 
