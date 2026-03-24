@@ -2,6 +2,26 @@
 
 This project builds a player similarity model that compares **how players play** (process) rather than only what they produce (box scores). It treats each player’s event history as a sequence and learns a **PlayerBERT** model over those event embeddings.
 
+## Repository layout
+
+| Path | Contents |
+|------|----------|
+| `playerbert/` | Python package: `EventEncoder` / feature helpers / **event-type similarity** (`similarity.py`) |
+| `notebooks/` | Jupyter notebooks (training, EDA, inference) |
+| `scripts/` | CLI utilities (e.g. StatsBomb join / slide figures) |
+| `docs/slides/` | Beamer slides + `figures/` for generated plots |
+| `open-data/` | Raw / processed event data (large files are gitignored; obtain locally) |
+| `models/` | Checkpoints and caches (place weights here; `*.pt` ignored by default) |
+
+Run Python from the **repository root** so default paths like `open-data/...` and `models/...` resolve correctly.
+
+**Event-type similarity (optional):** after placing `events360_v4.jsonl` and `event_encoder_mam.pt`, use a virtualenv with PyTorch, then:
+
+```bash
+python facet_similarity_tools.py build
+python facet_similarity_tools.py query --player "Your Player" --event-type Pass --top-k 10 --min-count 20
+```
+
 ## Model Architecture
 
 ### EventEncoder (token‑level / “word”)
@@ -68,19 +88,19 @@ This project builds a player similarity model that compares **how players play**
 ## Pipeline
 
 1. **Preprocess & join events + 360**
-   - Script: `preprocess_360_events.py`
+   - Script: `scripts/preprocess_360_events.py`
 2. **Data cleaning & flattening**
-   - Notebook: `data_processing.ipynb`
+   - Notebook: `notebooks/data_processing.ipynb`
    - Removes unique IDs, fills missing values, bucketizes numeric features,
      drops rare features, and **flattens** event attributes into dot‑keys.
 3. **EventEncoder pretraining**
-   - Notebook: `train_event_encoder.ipynb` (Colab)
+   - Notebook: `notebooks/train_event_encoder.ipynb` (Colab)
    - Masked Attribute Modeling on event features.
 4. **PlayerBERT training**
-   - Notebook: `train_playerbert.ipynb` (Colab)
+   - Notebook: `notebooks/train_playerbert.ipynb` (Colab)
    - Masked Event Modeling on event embeddings.
 5. **Inference / similarity search**
-   - Notebook: `infer_playerbert.ipynb` (Colab)
+   - Notebook: `notebooks/infer_playerbert.ipynb` (Colab)
    - Builds and caches player embeddings; supports nearest‑neighbor search.
 
 ## Notes & Assumptions

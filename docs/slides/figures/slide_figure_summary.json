@@ -1,0 +1,84 @@
+{
+  "cache_path": "/w/20251/zihenglin/MLSE-PlayerBERT/models/player_eventtype_profiles.pt",
+  "stats": {
+    "total_rows": 1027908,
+    "encoded_rows": 1027857,
+    "skipped_missing_player": 51,
+    "skipped_missing_type": 0,
+    "players_seen": 2409,
+    "event_types_seen": 22,
+    "stored_players": 2409,
+    "stored_event_types": 22,
+    "stored_profiles": 31039
+  },
+  "event_types": [
+    "50/50",
+    "Ball Receipt*",
+    "Ball Recovery",
+    "Block",
+    "Carry",
+    "Clearance",
+    "Dispossessed",
+    "Dribble",
+    "Dribbled Past",
+    "Duel",
+    "Error",
+    "Foul Committed",
+    "Foul Won",
+    "Goal Keeper",
+    "Interception",
+    "Miscontrol",
+    "Offside",
+    "Own Goal Against",
+    "Pass",
+    "Pressure",
+    "Shield",
+    "Shot"
+  ],
+  "per_type_totals": {
+    "Pass": 281860,
+    "Ball Receipt*": 277508,
+    "Carry": 241151,
+    "Pressure": 91692,
+    "Ball Recovery": 29416,
+    "Duel": 19445,
+    "Clearance": 12697,
+    "Block": 11820,
+    "Dribble": 8141,
+    "Shot": 8130,
+    "Miscontrol": 8108,
+    "Foul Committed": 6874,
+    "Interception": 6657,
+    "Dispossessed": 6629,
+    "Foul Won": 6520,
+    "Dribbled Past": 4705,
+    "Goal Keeper": 4628,
+    "50/50": 1276,
+    "Shield": 311,
+    "Error": 160,
+    "Offside": 93,
+    "Own Goal Against": 36
+  },
+  "per_type_totals_top5": [
+    [
+      "Pass",
+      281860
+    ],
+    [
+      "Ball Receipt*",
+      277508
+    ],
+    [
+      "Carry",
+      241151
+    ],
+    [
+      "Pressure",
+      91692
+    ],
+    [
+      "Ball Recovery",
+      29416
+    ]
+  ]
+}

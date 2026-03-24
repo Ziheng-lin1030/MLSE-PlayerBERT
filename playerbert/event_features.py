@@ -33,7 +33,7 @@ def normalize_feature_value(value: Any) -> Any:
 
 
 def build_feat_ids(ev: dict[str, Any], feature_vocab: dict[str, dict[Any, int]]) -> torch.Tensor:
-    """Map a single flattened event into the exact feature-id vector used by the notebooks."""
+    """Map a single flattened event into the exact feature-id vector used in the notebooks."""
     ids: list[int] = []
     for feat_name, vocab in feature_vocab.items():
         value = normalize_feature_value(get_by_path(ev, feat_name, UNK_TOKEN))
