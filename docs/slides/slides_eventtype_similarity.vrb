@@ -1,0 +1,16 @@
+\frametitle{Worked example: query output}
+\footnotesize
+  Example command: \texttt{query} for a forward, \texttt{Pass}, \texttt{top-k=5}, \texttt{min-count=20}.
+  \vspace{0.5em}
+  % ASCII-only: lstlisting is fragile with some UTF-8 names in certain TeX setups
+\begin{lstlisting}[language={},basicstyle=\ttfamily\tiny]
+Top 5 similar players ... for event_type=Pass (query_count=49):
+  Alexandra Morgan Carrasco (player_id=5085, sim=0.9850, count=75)
+  Borja Iglesias Quintas (player_id=11391, sim=0.9844, count=74)
+  Harry Kane (player_id=10955, sim=0.9913, count=21)
+  Aitana Bonmati Conca (player_id=15284, sim=0.9899, count=37)
+  Alphonso Davies (player_id=12365, sim=0.9899, count=22)
+\end{lstlisting}
+  \vspace{0.3em}
+  \footnotesize
+  \texttt{sim}: cosine similarity in $[0,1]$; \texttt{count}: $n_{p,\text{Pass}}$ for that neighbor.
